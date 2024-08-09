@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 import random
 import time
+import os
 
 import torch
 from datasets import load_dataset
@@ -81,6 +82,7 @@ def main():
         help="group size, -1 means no grouping or full rank",
     )
     parser.add_argument("--desc_act", action="store_true", help="whether to quantize with desc_act")
+    parser.add_argument("--damp_percent", type=float, default=0.01)
     parser.add_argument(
         "--dataset",
         type=str,
@@ -149,9 +151,10 @@ def main():
     )
     model = PLaMoGPTQForCausalLM.from_pretrained(
         args.pretrained_model_dir,
-        quantize_config=BaseQuantizeConfig(bits=args.bits, group_size=args.group_size, desc_act=args.desc_act),
+        quantize_config=BaseQuantizeConfig(bits=args.bits, group_size=args.group_size, desc_act=args.desc_act, damp_percent=args.damp_percent),
         max_memory=max_memory,
         trust_remote_code=args.trust_remote_code,
+        torch_dtype=torch.bfloat16,
     )
 
     traindataset = get_loader(args.dataset, args.num_samples, args.seqlen, tokenizer, args.seed)
@@ -162,6 +165,7 @@ def main():
         batch_size=args.quant_batch_size,
         use_triton=args.use_triton,
         autotune_warmup_after_quantized=args.use_triton,
+        #skip_layer=set("78_mlp.down_proj"),
     )
     end = time.time()
     print(f"quantization took: {end - start: .4f}s")
@@ -176,8 +180,8 @@ if __name__ == "__main__":
     import logging
 
     logging.basicConfig(
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] [%(name)s] %(message)s",
+        level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 

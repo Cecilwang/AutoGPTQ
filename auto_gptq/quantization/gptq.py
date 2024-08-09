@@ -33,8 +33,8 @@ class GPTQ:
 
     def add_batch(self, inp, out):
         if os.environ.get("DEBUG"):
-            self.inp1 = inp
-            self.out1 = out
+            self.inp1 = inp.clone()
+            self.out1 = out.clone()
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -54,9 +54,13 @@ class GPTQ:
             inp = inp.flatten(1)
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
-        # inp = inp.float()
         inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
+        if os.environ.get("DEBUG"):
+            if torch.isnan(inp).any() or torch.isinf(inp).any():
+                breakpoint() 
+            h = inp.matmul(inp.t())
+            if torch.isnan(h).any() or torch.isinf(h).any():
+                breakpoint() 
         self.H += inp.matmul(inp.t())
 
     def fasterquant(
@@ -112,11 +116,23 @@ class GPTQ:
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        cur_percdamp = percdamp
+        succ = False
+        while not succ:
+            try:
+                H[diag, diag] += damp
+                H = torch.linalg.cholesky(H)
+                H = torch.cholesky_inverse(H)
+                H = torch.linalg.cholesky(H, upper=True)
+                Hinv = H
+                succ = True
+            except torch._C._LinAlgError as e:
+                cur_percdamp += percdamp
+                print(f"Caught torch._C._LinAlgError: {e}")
+                print(f"H_diag min {torch.diag(H).min()} max {torch.diag(H).max()} mean {torch.diag(H).mean()}")
+                print(f"increasing percdamp to {cur_percdamp}")
+            except Exception as e:
+                raise e 
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -160,11 +176,11 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-            if os.environ.get("DEBUG"):
+            if os.environ.get("DEBUG") and False:
                 self.layer.weight.data[:, :i2] = Q[:, :i2]
                 self.layer.weight.data[:, i2:] = W[:, i2:]
-                logger.debug(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                logger.debug(torch.sum(Losses))
+                diff = self.layer(self.inp1) - self.out1
+                logger.debug(f"column {i1} diff squared sum {torch.sum(diff ** 2)} min {diff.min()}, max {diff.max()}, mean {diff.mean()} losses {torch.sum(Losses)}")
 
         torch.cuda.synchronize()
         logger.info(f"duration: {(time.time() - tick)}")
@@ -184,7 +200,8 @@ class GPTQ:
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).type_as(self.layer.weight.data)
         if os.environ.get("DEBUG"):
-            logger.debug(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+            diff = self.layer(self.inp1) - self.out1
+            logger.debug(f"sublayer diff squared sum {torch.sum(diff ** 2)} min {diff.min()}, max {diff.max()}, mean {diff.mean()}")
 
         if scale == []:
             scale.append(self.quantizer.scale)

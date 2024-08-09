@@ -180,6 +180,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         use_cuda_fp16: bool = True,
         autotune_warmup_after_quantized: bool = False,
         cache_examples_on_gpu: bool = True,
+        skip_layer: set = set(),
     ):
         if self.quantized:
             raise EnvironmentError("can't execute quantize because the model is quantized.")
@@ -312,6 +313,8 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
                     return tmp
 
+                if os.environ.get("DEBUG"):
+                    layer_gt_outputs = []
                 handles = []
                 for name in subset:
                     handles.append(subset[name].register_forward_hook(add_batch(name)))
@@ -329,12 +332,19 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                         additional_layer_inputs["position_ids"] = layer_position_ids
                     for k, v in layer_input_kwargs[j].items():
                         additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
-                    layer(*layer_input, **additional_layer_inputs)
+                    layer_gt_output = layer(*layer_input, **additional_layer_inputs)[0]
+                    if os.environ.get("DEBUG"):
+                        if torch.isnan(layer_gt_output).any() or torch.isinf(layer_gt_output).any():
+                            breakpoint()
+                        layer_gt_outputs.append([layer_gt_output])
                 for h in handles:
                     h.remove()
 
                 for name in subset:
                     logger.info(f"Quantizing {name} in layer {i + 1}/{len(layers)}...")
+                    if f"{i+1}_{name}" in skip_layer:
+                        logger.info(f"Skip {name} in layer {i + 1}/{len(layers)}...")
+                        continue
                     scale, zero, g_idx = gptq[name].fasterquant(
                         percdamp=self.quantize_config.damp_percent,
                         group_size=self.quantize_config.group_size,
@@ -365,12 +375,17 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                     layer(*layer_input, **additional_layer_inputs)[0],
                     cur_layer_device if cache_examples_on_gpu else CPU,
                 )
+                if os.environ.get("DEBUG"):
+                    if torch.isnan(layer_output).any() or torch.isinf(layer_output).any():
+                        breakpoint() 
                 layer_outputs.append([layer_output])
 
             layers[i] = move_to_device(layer, CPU if force_layer_back_to_cpu else cur_layer_device)
             del layer
             del gptq
             del layer_inputs
+            if os.environ.get("DEBUG"):
+                del layer_gt_outputs
             layer_inputs, layer_outputs = layer_outputs, []  # TODO: is it really OK to cache only the first positional argument?
             torch.cuda.empty_cache()
 
